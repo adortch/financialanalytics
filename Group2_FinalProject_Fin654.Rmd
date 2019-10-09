@@ -1,0 +1,947 @@
+---
+title: 'Final Project'
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+    source_code: embed
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, eval = TRUE, warning=FALSE, message=FALSE)
+library(flexdashboard)
+options(digits = 4, scipen = 999999)
+library(psych)
+library(ggplot2)
+library(GGally)
+library(dplyr)
+library(quantreg)
+library(forecast)
+library(tidyquant)
+library(quantmod)
+library(matrixStats)
+library(plotly)
+library(quadprog)
+library(shiny)
+library(mvtnorm)
+#
+#
+symbols <- c("BUD", "TWE.AX", "CWGL")
+getSymbols(symbols) # using quantmod
+data <- BUD
+data <- data[ , 6] # only adjusted close  
+colnames(data) <- "BUD"
+r_BUD <- diff(log(data))[-1] 
+# convert xts object to a tibble or data frame
+p_BUD <- data %>% as_tibble() %>% mutate(date = index(data), month = month.abb[month(index(data))])
+# repeat
+data <- TWE.AX
+data <- data[ , 6]  
+colnames(data) <- "TWE.AX"
+r_TWE.AX <- diff(log(data))[-1]
+p_TWE.AX <- data %>% as_tibble() %>% mutate(date = index(data), month = month.abb[month(index(data))])
+# and again
+data <- CWGL
+data <- data[ , 6]  
+colnames(data) <- "CWGL"
+r_CWGL <- diff(log(data))[-1]
+p_CWGL <- data %>% as_tibble() %>% mutate(date = index(data), month = month.abb[month(index(data))])#rate_IYM <- data %>% mutate(diff(log(p_IYM))[-1])
+# merge by date (as row name)
+price <- merge(p_BUD, p_TWE.AX)
+price <- merge(price, p_CWGL)
+return <- merge(BUD = r_BUD, TWE.AX = r_TWE.AX, CWGL = r_CWGL, all = FALSE)
+# calculute within month correlations and choose lower triangle of correlation matrix
+r_corr <- apply.monthly(return, FUN = cor)[, c(2, 3, 6)]
+colnames(r_corr) <- c("BUD_TWE.AX", "BUD_CWGL", "TWE.AX_CWGL")
+# calculate within month standard deviations using MatrixStats
+r_vols <- apply.monthly(return, FUN = colSds)
+# long format ("TIDY") price tibble for possible other work
+price_tbl <- price %>% as_tibble() %>% gather(k = symbol, value = price, BUD, TWE.AX, CWGL ) %>% select(symbol, date, price)
+return_tbl <- price_tbl %>% group_by(symbol) %>% tq_transmute(mutate_fun = periodReturn, period = "daily", type = "log", col_rename = "daily_return") %>% mutate(abs_return = abs(daily_return))
+# 
+corr_tbl <- r_corr %>% as_tibble() %>% mutate(date = index(r_corr)) %>% gather(key = assets, value = corr, -date)
+vols_tbl <- r_vols %>% as_tibble() %>% mutate(date = index(r_vols)) %>% gather(key = assets, value = vols, -date) 
+#
+corr_vols <- merge(r_corr, r_vols)
+corr_vols_tbl <- corr_vols %>% as_tibble() %>% mutate(date = index(corr_vols))
+#
+# Tukey-Box-Hunter fence analysis of outliers
+#
+k <- 1:20 # days in a business month
+col_names <- paste0("lag_", k)
+#
+# remove abs_return the fourth column
+return_lags <- return_tbl[, -4] %>%
+  tq_mutate(
+  select     = daily_return,
+  mutate_fun = lag.xts,
+  k          = k,
+  col_rename = col_names
+  )
+return_autocors <- return_lags %>%
+  gather(key = "lag", value = "lag_value", -c(symbol, date, daily_return)) %>%
+  mutate(lag = str_sub(lag, start = 5) %>% as.numeric) %>%
+  group_by(symbol, lag) %>%
+  summarize(
+    cor = cor(x = daily_return, y = lag_value, use = "pairwise.complete.obs"),
+    upper_95 = 2/(n())^0.5,
+    lower_95 = -2/(n())^0.5
+  )
+return_absautocors <- return_autocors %>%
+  ungroup() %>%
+  mutate(
+    lag = as_factor(as.character(lag)),
+    cor_abs = abs(cor)
+  ) %>%
+  select(lag, cor_abs) %>%
+  group_by(lag)
+#
+# loss analysis
+#
+price_last <- price[length(price$BUD), 3:5] #(BUD, TWE.AX, CWGL)
+value <- 1000000 # portfolio value
+w_0 <- c(0.45, -0.07, 0.62) # wwights -- e.g., min variance or max sharpe
+shares <- value * (w_0/price_last)
+w <- as.numeric(shares * price_last)
+return_hist <- apply(log(price[, 3:5]), 2, diff)
+# Fan these across the length and breadth of the risk factor series
+weights_rf <- matrix(w, nrow=nrow(return_hist), ncol=ncol(return_hist), byrow=TRUE)
+## We need to compute exp(x) - 1 for very small x: expm1 accomplishes this
+loss_rf <- -rowSums(expm1(return_hist) * weights_rf)
+loss_df <- data_frame(loss = loss_rf, distribution = rep("historical", each = length(loss_rf)))
+#
+ES_calc <- function(data, prob){
+  threshold <- quantile(data, prob)
+  result <- mean(data[data > threshold])
+}
+#
+n_sim <- 1000
+n_sample <- 100
+prob <- 0.95
+ES_sim <- replicate(n_sim, ES_calc(sample(loss_rf, n_sample, replace = TRUE), prob))
+#
+#summary(ES_sim)
+#
+# mean excess plot to determine thresholds for extreme event management
+data <- as.vector(loss_rf) # data is purely numeric
+umin <-  min(data)         # threshold u min
+umax <-  max(data) - 0.1   # threshold u max
+nint <- 100                # grid length to generate mean excess plot
+grid_0 <- numeric(nint)    # grid store
+e <- grid_0                # store mean exceedances e
+upper <- grid_0            # store upper confidence interval
+lower <- grid_0            # store lower confidence interval
+u <- seq(umin, umax, length = nint) # threshold u grid
+alpha <- 0.95                  # confidence level
+for (i in 1:nint) {
+    data <- data[data > u[i]]  # subset data above thresholds
+    e[i] <- mean(data - u[i])  # calculate mean excess of threshold
+    sdev <- sqrt(var(data))    # standard deviation
+    n <- length(data)          # sample size of subsetted data above thresholds
+    upper[i] <- e[i] + (qnorm((1 + alpha)/2) * sdev)/sqrt(n) # upper confidence interval
+    lower[i] <- e[i] - (qnorm((1 + alpha)/2) * sdev)/sqrt(n) # lower confidence interval
+  }
+mep_df <- data.frame(threshold = u, threshold_exceedances = e, lower = lower, upper = upper)
+# loss_excess <- loss_rf[loss_rf > u] - u
+quantInv <- function(distr, value) ecdf(distr)(value)
+u_prob <- quantInv(loss_rf, 200000)
+ES_mep <- mean(loss_rf[loss_rf > u_prob])## data_moments function
+## INPUTS: r vector
+## OUTPUTS: list of scalars (mean, sd, median, skewness, kurtosis)
+data_moments <- function(data){
+  library(moments)
+  library(matrixStats)
+  mean <- colMeans(data)
+  median <- colMedians(data)
+  sd <- colSds(data)
+  IQR <- colIQRs(data)
+  skewness <- skewness(data)
+  kurtosis <- kurtosis(data)
+  result <- data.frame(mean = mean, median = median, std_dev = sd, IQR = IQR, skewness = skewness, kurtosis = kurtosis)
+  return(result)
+}
+#
+#
+port_sample <- function(return, n_sample = 252, stat = "mean")
+{
+  R <-  return # daily returns
+  n <- dim(R)[1]
+  N <- dim(R)[2]
+  R_boot <-  R[sample(1:n, n_sample),] # sample returns
+  r_free <- 0.03 / 252 # daily
+  mean_vect <-  apply(R_boot,2,mean)
+  cov_mat <-  cov(R_boot)
+  sd_vect <-  sqrt(diag(cov_mat))
+  A_mat <-  cbind(rep(1,N),mean_vect) 
+  mu_P <-  seq(-.01,.01,length=300)                              
+  sigma_P <-  mu_P 
+  weights <-  matrix(0,nrow=300,ncol=N) 
+  for (i in 1:length(mu_P))  
+  {
+    b_vec <-  c(1,mu_P[i])  
+    result <-  
+      solve.QP(Dmat=2*cov_mat,dvec=rep(0,N),Amat=A_mat,bvec=b_vec,meq=2)
+    sigma_P[i] <-  sqrt(result$value)
+    weights[i,] <-  result$solution
+  }
+  sharpe <- (mu_P - r_free)/sigma_P ## compute Sharpe's ratios
+  ind_max <-  (sharpe == max(sharpe)) ## Find maximum Sharpe's ratio
+  ind_min <-  (sigma_P == min(sigma_P)) ## find the minimum variance portfolio
+  ind_eff <-  (mu_P > mu_P[ind_min]) ## finally the efficient fr(aes(x = 0, y = r_free), colour = "red")ontier
+  result <- switch(stat,
+    "mean"  = mu_P[ind_max],
+    "sd"    = sigma_P[ind_max]
+    )
+  return(result)
+}
+#
+
+
+```
+
+Context
+==============================================
+
+Column {.sidebar}
+-----------------------------------------------------------------------
+Market Risk and Return Stylized Facts on the Beverages-Wineries & Distilleries Sector
+
+Report Prepared by: Arielle Dortch, Mellissa Nguon, Jerry Ventura, Mindy Watson
+
+Date: 17-Mar-2019
+
+### Situation
+
+MAAM Winery located in California is looking to expand its earning and opportunities by introducing an organic wine product into the market. The CFO is requesting this Project Team to measure the impact of the alcoholic beverages sector on the earnings of several brewers, wineries and distilleries. The following 3 ETFs: BUD, TWE.AX, and CWGL have been selected to conduct our financial analysis. 
+
+### Complications
+The company has experienced very high volatility of earnings in the winery and distillery sector. There is increased competition in these and their substitute and complementary markets. New sustainable, organic products are increasingly successful in entering the market and leveraging the demand among new and existing consumers. The company needs to determine if adding a new product to their current portfolio of offerings is a profitable business decision.
+
+column{.tabset}
+------------------------------------------------------
+
+### Key questions
+
+The CFO has a few questions for us:
+
+1. How should the company plan to meet risk tolerances and thresholds for loss?
+
+2. How do we evaluate the variability for wine and the impact of one market on another?
+
+3. What are the market and capital risks? How much capital is needed at a 5% tolerance for loss? What about an even less tolerance 1% of the time? 
+
+### Data
+
+For the Wineries & Distilleries sector we selected the following 3 ETFs, http://www.isbg.global, http://www.tweglobal.com, and http://www.crimsonwinegroup.com 
+
+- BUD for Beverages - Brewers in Leuven, Belgium
+
+- TWE.AX for Beverages - Wineries & Distilleries in Melbourgne, VIC, Australia
+
+- CWGL for Beverages - Wineries & Distilleries in Napa, CA, USA
+
+These funds act as indices to effectively summarize the inputs, process, management, decisions, and outputs of various aspects of the Beverages - Brewers, Wineries & Distilleries sector.
+
+We load historical data on three ETFs, tranform prices into returns, and then further transform the returns into within-month correlations and standard deviations.
+
+### Work flow
+
+Our process includes 
+
+- Review the stylized facts of volatility and relationships among three repesentative markets.
+
+- Develop market risk measures for each driver of earnings.
+
+- Apply corporate risk tolerances and thresholds to determine optimal collateral positions for each driver of earnings.
+
+- Determine optimal combinations of the drivers for maximum excess portfolio return relative to portfolio risk as well as the minimization of risk
+
+- Given the optimal maximum excess return per risk portfolio, determine the probable range of collateral needed to satisfy corporate risk tolerance and thresholds.
+
+Returns
+=======================================================================
+
+column {.sidebar}
+----------------------------------------------------
+
+<h3> Summary </h3>
+
+#### Overall
+
+#### Persistence
+
+#### Outliers
+
+column {.tabset}
+----------------------------------------------------
+
+### Beverages
+
+```{r moments}
+ggpairs(as.data.frame(return[, 1:3]))
+```
+
+### BUD
+
+```{r}
+ggtsdisplay(return$BUD, plot.type = "histogram", main = "BUD daily returns")
+```
+
+### TWE.AX
+
+```{r}
+ggtsdisplay(return$TWE.AX, plot.type = "histogram", main = "TWE.AX daily returns")
+```
+
+### CWGL
+
+```{r}
+ggtsdisplay(return$CWGL, plot.type = "histogram", main = "CWGL daily returns")
+```
+
+### Return persistence
+
+```{r plotreturnabscors, exercise = TRUE}
+# Tukey's fence
+upper_bound <- 1.5*IQR(return_absautocors$cor_abs) %>% signif(3)
+p <- return_absautocors %>%    
+      ggplot(aes(x = fct_reorder(lag, cor_abs, .desc = TRUE) , y = cor_abs)) +
+      # Add boxplot
+      geom_boxplot(color = palette_light()[[1]]) +
+      # Add horizontal line at outlier break point
+      geom_hline(yintercept = upper_bound, color = "red") +
+      annotate("text", label = paste0("Outlier threshold = ", upper_bound), 
+        x = 24.5, y = upper_bound + .03, color = "red") +
+      # Aesthetics
+      expand_limits(y = c(0, 0.5)) +
+      theme_tq() +
+      labs(
+        title = paste0("Absolute Autocorrelations: Lags ", rlang::expr_text(k)),
+        x = "Lags"
+        ) +
+      theme(
+        legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust = 1)
+        )
+ggplotly(p)
+```
+
+Volatility
+====================================================
+
+column {.sidebar}
+----------------------------------------------------
+
+<h3> Summary </h3>
+
+### Monthly volatility
+
+### Monthly Correlation
+
+column {.tabset}
+----------------------------------------------------
+
+### BUD
+
+```{r}
+ggtsdisplay(r_vols$BUD, plot.type = "histogram", main = "BUD monthly volatility")
+```
+
+### TWE.AX
+```{r}
+ggtsdisplay(r_vols$TWE.AX, plot.type = "histogram", main = "TWE.AX monthly volatility")
+```
+
+### CWGL
+
+```{r}
+ggtsdisplay(r_vols$CWGL, plot.type = "histogram", main = "CWGL monthly volatility")
+```
+
+column {.tabset}
+----------------------------------------------------
+
+### BUD-TWE.AX
+
+```{r}
+ggtsdisplay(r_corr$BUD_TWE.AX, plot.type = "histogram", main = "BUD-TWE.AX monthly correlation")
+```
+
+Notes
+
+### BUD-CWGL
+
+```{r}
+ggtsdisplay(r_corr$BUD_CWGL, plot.type = "histogram", main = "BUD-CWGL monthly correlation")
+```
+
+### TWE.AX-CWGL
+
+```{r}
+ggtsdisplay(r_corr$TWE.AX_CWGL, plot.type = "histogram", main = "TWE.AX-CWGL monthly correlation")
+```
+
+### BUD-TWE.AX market spillover
+
+```{r rqplot-BUD-TWE.AX}
+p <- ggplot(corr_vols_tbl,  aes(x = TWE.AX, y = BUD_TWE.AX)) +
+    geom_point() + 
+    ggtitle("BUD-TWE.AX Interaction") + 
+    geom_quantile(quantiles = c(0.10, 0.90)) + 
+    geom_quantile(quantiles = 0.5, linetype = "longdash") +
+    geom_density_2d(colour = "red")  
+ggplotly(p)
+```
+
+### BUD-CWGL market spillover
+
+```{r rqplot-BUD-CWGL}
+p <- ggplot(corr_vols_tbl,  aes(x = CWGL, y = BUD_CWGL)) +
+    geom_point() + 
+    ggtitle("BUD-CWGL Interaction") + 
+    geom_quantile(quantiles = c(0.10, 0.90)) + 
+    geom_quantile(quantiles = 0.5, linetype = "longdash") +
+    geom_density_2d(colour = "red")  
+ggplotly(p)
+```
+
+### TWE.AX-CWGL market spillover
+
+```{r rqplot-TWE.AX-CWGL}
+p <- ggplot(corr_vols_tbl,  aes(x = CWGL, y = TWE.AX_CWGL)) +
+    geom_point() + 
+    ggtitle("TWE.AX-CWGL Interaction") + 
+    geom_quantile(quantiles = c(0.10, 0.90)) + 
+    geom_quantile(quantiles = 0.5, linetype = "longdash") +
+    geom_density_2d(colour = "red")  
+ggplotly(p)
+```
+
+
+Loss
+============================================
+
+column {.sidebar}
+----------------------------------------------------
+
+<h3> Financial Loss Analysis </h3>
+
+How much capital do we need to support this portfolio if our risk tolerance for loss is only 5%?
+
+
+column {.tabset}
+--------------------------------------------
+
+### BUD 
+
+```{r BUDloss}
+#
+shares <- c(-215000, 0, 0)
+price_last <- price[length(price$BUD), 3:5] #(BUD, TWE.AX, CWGL) %>% as.vector()
+w <- as.numeric(shares * price_last)
+return_hist <- apply(log(price[, 3:5]), 2, diff)
+# Fan these across the length and breadth of the risk factor series
+weights_rf <- matrix(w, nrow=nrow(return_hist), ncol=ncol(return_hist), byrow=TRUE)
+## We need to compute exp(x) - 1 for very small x: expm1 accomplishes this
+loss_rf <- -rowSums(expm1(return_hist) * weights_rf)
+loss_df <- data_frame(loss = loss_rf, distribution = rep("historical", each = length(loss_rf)))
+#
+ES_calc <- function(data, prob){
+  threshold <- quantile(data, prob)
+  result <- mean(data[data > threshold])
+}
+#
+n_sim <- 1000
+n_sample <- 100
+prob <- 0.95
+ES_sim <- replicate(n_sim, ES_calc(sample(loss_rf, n_sample, replace = TRUE), prob))
+#
+sim <- ES_sim
+low <- quantile(sim, 0.025)
+high <- quantile(sim, 0.975)
+sim_df <- data_frame(sim = sim)
+title <- "BUD: Expected Shortfall simulation"
+p <- ggplot(data = sim_df, aes(x = sim))
+p <- p + geom_histogram(binwidth = 1000, aes(y = 1000*(..density..)), alpha = 0.4)
+p <- p + ggtitle(title)
+p <- p + geom_vline(xintercept = low, color = "red", size = 1.5 ) + geom_vline(xintercept = high, color = "red", size = 1.5)
+p <- p + annotate("text", x = low, y = 0.01, label = paste("L = ", round(low, 2))) + annotate("text", x = high, y = 0.01, label = paste("U = ", round(high, 2))) + ylab("density") + xlab("expected shortfall") + theme_bw()
+ggplotly(p)
+```
+
+### TWE.AX
+
+```{r TWE.AXloss}
+#
+shares <- c(0, 284000, 0)
+price_last <- price[length(price$BUD), 3:5] #(BUD, TWE.AX, CWGL) %>% as.vector()
+w <- as.numeric(shares * price_last)
+return_hist <- apply(log(price[, 3:5]), 2, diff)
+# Fan these across the length and breadth of the risk factor series
+weights_rf <- matrix(w, nrow=nrow(return_hist), ncol=ncol(return_hist), byrow=TRUE)
+## We need to compute exp(x) - 1 for very small x: expm1 accomplishes this
+loss_rf <- -rowSums(expm1(return_hist) * weights_rf)
+loss_df <- data_frame(loss = loss_rf, distribution = rep("historical", each = length(loss_rf)))
+#
+ES_calc <- function(data, prob){
+  threshold <- quantile(data, prob)
+  result <- mean(data[data > threshold])
+}
+#
+n_sim <- 1000
+n_sample <- 100
+prob <- 0.95
+ES_sim <- replicate(n_sim, ES_calc(sample(loss_rf, n_sample, replace = TRUE), prob))
+#
+sim <- ES_sim
+low <- quantile(sim, 0.025)
+high <- quantile(sim, 0.975)
+sim_df <- data_frame(sim = sim)
+title <- "TWE.AX: Expected Shortfall simulation"
+p <- ggplot(data = sim_df, aes(x = sim))
+p <- p + geom_histogram(binwidth = 1000, aes(y = 1000*(..density..)), alpha = 0.4)
+p <- p + ggtitle(title)
+p <- p + geom_vline(xintercept = low, color = "red", size = 1.5 ) + geom_vline(xintercept = high, color = "red", size = 1.5)
+p <- p + annotate("text", x = low, y = 0.01, label = paste("L = ", round(low, 2))) + annotate("text", x = high, y = 0.01, label = paste("U = ", round(high, 2))) + ylab("density") + xlab("expected shortfall") + theme_bw()
+ggplotly(p)
+```
+
+### CWGL
+
+```{r CWGLloss}
+#
+shares <- c(0, 0, 12500)
+price_last <- price[length(price$BUD), 3:5] #(BUD, TWE.AX, CWGL) %>% as.vector()
+w <- as.numeric(shares * price_last)
+return_hist <- apply(log(price[, 3:5]), 2, diff)
+# Fan these across the length and breadth of the risk factor series
+weights_rf <- matrix(w, nrow=nrow(return_hist), ncol=ncol(return_hist), byrow=TRUE)
+## We need to compute exp(x) - 1 for very small x: expm1 accomplishes this
+loss_rf <- -rowSums(expm1(return_hist) * weights_rf)
+loss_df <- data_frame(loss = loss_rf, distribution = rep("historical", each = length(loss_rf)))
+#
+ES_calc <- function(data, prob){
+  threshold <- quantile(data, prob)
+  result <- mean(data[data > threshold])
+}
+#
+n_sim <- 1000
+n_sample <- 100
+prob <- 0.95
+ES_sim <- replicate(n_sim, ES_calc(sample(loss_rf, n_sample, replace = TRUE), prob))
+#
+sim <- ES_sim
+low <- quantile(sim, 0.025)
+high <- quantile(sim, 0.975)
+sim_df <- data_frame(sim = sim)
+title <- "CWGL: Expected Shortfall simulation"
+p <- ggplot(data = sim_df, aes(x = sim))
+p <- p + geom_histogram(binwidth = 1000, aes(y = 1000*(..density..)), alpha = 0.4)
+p <- p + ggtitle(title)
+p <- p + geom_vline(xintercept = low, color = "red", size = 1.5 ) + geom_vline(xintercept = high, color = "red", size = 1.5)
+p <- p + annotate("text", x = low, y = 0.01, label = paste("L = ", round(low, 2))) + annotate("text", x = high, y = 0.01, label = paste("U = ", round(high, 2))) + ylab("density") + xlab("expected shortfall") + theme_bw()
+ggplotly(p)
+```
+
+### Summary of Loss
+
+Summary statistics & the loss distribution plots
+
+```{r}
+price_etf <- price %>% select(BUD, TWE.AX, CWGL) # 3 risk factors (rf)
+price_0 <- as.numeric(tail(price_etf, 1))
+shares <- c(60000, 75000, 50000)
+price_last <- price[length(price$BUD), 3:5] #(BUD, TWE.AX, CWGL) %>% as.vector()
+w <- as.numeric(shares * price_last)
+return_hist <- apply(log(price[, 3:5]), 2, diff)
+# Fan these across the length and breadth of the risk factor series
+weights_rf <- matrix(w, nrow=nrow(return_hist), ncol=ncol(return_hist), byrow=TRUE)
+## We need to compute exp(x) - 1 for very small x: expm1 accomplishes this
+loss_rf <- -rowSums(expm1(return_hist) * weights_rf)
+summary(loss_rf)
+forecast::ggtsdisplay(loss_rf, plot.type = "histogram")
+# a little nicer
+loss_df <- data_frame(loss = loss_rf, distribution = rep("historical", each = length(loss_rf)))
+ggplot(loss_df, aes(x = loss, fill = distribution)) + geom_density(alpha = 0.2) + xlim(0, max(loss_rf))
+```
+
+### Value at Risk: Expected Shortfall
+
+```{r}
+## Simple Value at Risk
+alpha_tolerance <- .95
+(VaR_hist <- quantile(loss_rf, probs=alpha_tolerance, names=FALSE))
+## Just as simple Expected shortfall
+(ES_hist <- mean(loss_rf[loss_rf > VaR_hist]))
+VaR_text <- paste("Value at Risk =", round(VaR_hist, 2))
+ES_text <- paste("Expected Shortfall =", round(ES_hist, 2))
+ggplot(loss_df, aes(x = loss, fill = distribution)) + geom_density(alpha = 0.2) + xlim(0, max(loss_rf))+
+  geom_vline(aes(xintercept = VaR_hist), linetype = "dashed", size = 1, color = "blue") +
+  geom_vline(aes(xintercept = ES_hist), size = 1, color = "blue") + xlim(0,max(loss_rf)) + 
+  annotate("text", x = 200000, y = 0.000010, label = VaR_text) +
+  annotate("text", x = 350000, y = 0.000005, label = ES_text)
+```
+
+
+Allocation
+============================================
+
+column {.sidebar}
+--------------------------------------------
+
+```{r eff-frontier-calc}
+R <-  return # daily returns
+n <- dim(R)[1]
+N <- dim(R)[2]
+R_boot <-  R[sample(1:n, 252),] # sample returns
+r_free <- 0.03 / 252 # daily
+mean_vect <-  apply(R_boot,2,mean)
+cov_mat <-  cov(R_boot)
+sd_vect <-  sqrt(diag(cov_mat))
+A_mat <-  cbind(rep(1,N),mean_vect) 
+mu_P <-  seq(-.01,.01,length=300)                              
+sigma_P <-  mu_P 
+weights <-  matrix(0,nrow=300,ncol=N) 
+for (i in 1:length(mu_P))  
+  {
+    b_vec <-  c(1,mu_P[i])  
+    result <-  
+      solve.QP(Dmat=2*cov_mat,dvec=rep(0,N),Amat=A_mat,bvec=b_vec,meq=2)
+    sigma_P[i] <-  sqrt(result$value)
+    weights[i,] <-  result$solution
+} 
+# make a data frame of the mean and standard deviation results
+sigma_mu_df <- data_frame(sigma_P = sigma_P, mu_P = mu_P)
+names_R <- c("BUD", "TWE.AX", "CWGL")
+# sharpe ratio and minimum variance portfolio analysis
+sharpe <- (mu_P - r_free)/sigma_P ## compute Sharpe's ratios
+ind_max <-  (sharpe == max(sharpe)) ## Find maximum Sharpe's ratio
+ind_min <-  (sigma_P == min(sigma_P)) ## find the minimum variance portfolio
+ind_eff <-  (mu_P > mu_P[ind_min]) ## finally the efficient fr(aes(x = 0, y = r_free), colour = "red")ontier
+w_max <- weights[ind_max,]
+w_min <- weights[ind_min,]
+value <- 1000000
+weights[ind_max,]
+```
+
+### Optimal weights
+
+We use these maximum Sharpe Ratio weights to form a risky asset loss series:
+
+BUD: `r round(w_max[1] * 100, 2)`%, TWE.AX: `r round(w_max[2] * 100, 2)`%, CWGL: `r round(w_max[3] * 100, 2)`% of total portfolio value of USD `r value` with a daily return of `r round(mu_P[ind_max]*100, 2)`% and standard deviation of `r round(sigma_P[ind_max]*100, 2)`% 
+
+These weights will produce a minimum variance portfolio:
+
+BUD: `r round(w_min[1] * 100, 2)`%, TWE.AX: `r round(w_min[2] * 100, 2)`%, CWGL: `r round(w_min[3] * 100, 2)`% of total portfolio value of USD `r value` with a daily portfolio return of `r round(mu_P[ind_min]*100, 2)`% and standard deviation of `r round(sigma_P[ind_min]*100, 2)`%
+
+### Thresholds
+
+- overall
+
+### Loss range
+
+
+### Collateral concerns
+
+How much collateral do we need to meet company risk tolerances and thresholds?
+
+
+column {.tabset}
+--------------------------------------------
+
+### Efficient frontier
+
+```{r eff-frontier}
+col_P <- ifelse(mu_P > mu_P[ind_min], "blue", "grey") # discriminate efficient and inefficient portfolios
+sigma_mu_df$col_P <- col_P
+p <- ggplot(sigma_mu_df, aes(x = sigma_P, y = mu_P, group = 1))
+p <- p + geom_line(aes(colour=col_P, group = col_P), size = 1.1) + scale_colour_identity() 
+p <- p + geom_abline(intercept = r_free, slope = (mu_P[ind_max]-r_free)/sigma_P[ind_max], color = "red", size = 1.1)
+p <- p + geom_point(aes(x = sigma_P[ind_max], y = mu_P[ind_max]), color = "green", size = 4) 
+p <- p + geom_point(aes(x = sigma_P[ind_min], y = mu_P[ind_min]), color = "red", size = 4) ## show min var portfolio
+p
+ggplotly(p)
+```
+
+### Sharpe mean CI
+
+```{r sampledmean-ex}
+port_mean <- replicate(1000, port_sample(return, n_sample = 252, stat = "mean"))
+sim <- port_mean * 252
+low <- quantile(sim, 0.025)
+high <- quantile(sim, 0.975)
+sim_df <- data_frame(sim = sim)
+title <- "Tangency portfolio sampled mean simulation"
+p <- ggplot(data = sim_df, aes(x = sim))
+p <- p + geom_histogram(alpha = 0.7)
+p <- p + ggtitle(title)
+p <- p + geom_vline(xintercept = low, color = "red", size = 1.5 ) + geom_vline(xintercept = high, color = "red", size = 1.5)
+p <- p + annotate("text", x = low + 0.01, y = 200, label = paste("L = ", round(low, 2))) + annotate("text", x = high, y = 200, label = paste("U = ", round(high, 2))) + ylab("density") + xlab("daily mean: max Sharpe Ratio") + theme_bw()
+ggplotly(p)
+```
+
+### Sharpe standard deviation CI
+
+```{r sampledsd-ex}
+port_mean <- replicate(1000, port_sample(return, n_sample = 252, stat = "sd"))
+sim <- port_mean * 252
+low <- quantile(sim, 0.025)
+high <- quantile(sim, 0.975)
+sim_df <- data_frame(sim = sim)
+title <- "Tangency portfolio sampled standard deviation simulation"
+p <- ggplot(data = sim_df, aes(x = sim))
+p <- p + geom_histogram(alpha = 0.7)
+p <- p + ggtitle(title)
+p <- p + geom_vline(xintercept = low, color = "red", size = 1.5 ) + geom_vline(xintercept = high, color = "red", size = 1.5)
+p <- p + annotate("text", x = low + 0.1, y = 200, label = paste("L = ", round(low, 2))) + annotate("text", x = high, y = 200, label = paste("U = ", round(high, 2))) + ylab("density") + xlab("daily mean: max Sharpe Ratio") + theme_bw()
+ggplotly(p)
+```
+
+### Max Sharpe Ratio loss thresholds
+
+```{r mepcalc}
+price_last <- price[length(price$BUD), 3:5] #(BUD, TWE.AX, CWGL)
+value <- 1000000 # portfolio value
+w_0 <- w_max # wwights -- e.g., min variance or max sharpe
+shares <- value * (w_0/price_last)
+w <- as.numeric(shares * price_last)
+return_hist <- apply(log(price[, 3:5]), 2, diff)
+# Fan these across the length and breadth of the risk factor series
+weights_rf <- matrix(w, nrow=nrow(return_hist), ncol=ncol(return_hist), byrow=TRUE)
+## We need to compute exp(x) - 1 for very small x: expm1 accomplishes this
+loss_rf <- -rowSums(expm1(return_hist) * weights_rf)
+loss_df <- data_frame(loss = loss_rf, distribution = rep("historical", each = length(loss_rf)))
+#
+data <- as.vector(loss_rf[loss_rf > 0]) # data is purely numeric
+umin <-  min(data)         # threshold u min
+umax <-  max(data) - 0.1   # threshold u max
+nint <- 100                # grid length to generate mean excess plot
+grid_0 <- numeric(nint)    # grid store
+e <- grid_0                # store mean exceedances e
+upper <- grid_0            # store upper confidence interval
+lower <- grid_0            # store lower confidence interval
+u <- seq(umin, umax, length = nint) # threshold u grid
+alpha <- 0.95                  # confidence level
+for (i in 1:nint) {
+    data <- data[data > u[i]]  # subset data above thresholds
+    e[i] <- mean(data - u[i])  # calculate mean excess of threshold
+    sdev <- sqrt(var(data))    # standard deviation
+    n <- length(data)          # sample size of subsetted data above thresholds
+    upper[i] <- e[i] + (qnorm((1 + alpha)/2) * sdev)/sqrt(n) # upper confidence interval
+    lower[i] <- e[i] - (qnorm((1 + alpha)/2) * sdev)/sqrt(n) # lower confidence interval
+  }
+mep_df <- data.frame(threshold = u, threshold_exceedances = e, lower = lower, upper = upper)
+```
+
+
+```{r loss-mep}
+# Voila the plot => you may need to tweak these limits!
+p <- ggplot(mep_df, aes( x= threshold, y = threshold_exceedances)) + geom_line() + geom_line(aes(x = threshold, y = lower), colour = "red") + geom_line(aes(x = threshold,  y = upper), colour = "red") + annotate("text", x = mean(mep_df$threshold), y = max(mep_df$upper)+100, label = "upper 95%") + annotate("text", x = mean(mep_df$threshold), y = min(mep_df$lower) - 100, label = "lower 5%") + ggtitle("Mean Excess Plot: maximum Sharpe Ratio portfolio") + ylab("threshold exceedances")
+ggplotly(p)
+```
+
+
+### Risky capital
+
+```{r loss-capital}
+n_sim <- 1000
+n_sample <- 100
+prob <- 0.95
+ES_sim <- replicate(n_sim, ES_calc(sample(loss_rf, n_sample, replace = TRUE), prob))
+#
+sim <- ES_sim
+low <- quantile(sim, 0.025)
+high <- quantile(sim, 0.975)
+sim_df <- data_frame(sim = sim)
+title <- paste0("Loss Capital Simulation: alpha =  ", alpha*100, "% bounds")
+p <- ggplot(data = sim_df, aes(x = sim))
+p <- p + geom_histogram(alpha = 0.4)
+p <- p + ggtitle(title)
+p <- p + geom_vline(xintercept = low, color = "red", size = 1.5 ) + geom_vline(xintercept = high, color = "red", size = 1.5)
+p <- p + annotate("text", x = low, y = 100, label = paste("L = ", round(low, 2))) + annotate("text", x = high, y = 100, label = paste("U = ", round(high, 2))) + ylab("density") + xlab("expected shortfall") + theme_bw()
+ggplotly(p)
+```
+
+### Collateral
+
+```{r collateral}
+options(digits = 2, scipen = 99999)
+#
+r_f <- 0.03 # per annum
+mu <- mu_P[ind_max] * 252 # pull mu and sigma for tangency portfolio
+sigma <- sigma_P[ind_max] * sqrt(252)
+#
+sigma_p <- seq(0, sigma + 0.25, length.out = 100)
+mu_p <- r_f + (mu - r_f)*sigma_p/sigma
+w <- sigma_p / sigma
+threshold <- -0.12
+alpha <- 0.05
+z_star <-  qnorm(alpha)
+w_star <- (threshold-r_f) / (mu - r_f + sigma*z_star)
+sim_df <- data_frame(sigma_p = sigma_p, mu_p = mu_p, w = w)
+#
+label_42 <- paste(alpha*100, "% alpha, ", threshold*100, "% threshold, \n", round(w_star*100, 2), "% risky asset", sep = "")
+label_0 <- paste(0*100, "% risky asset", sep = "")
+label_100 <- paste(1.00*100, "% risky asset", sep = "")
+p <- ggplot(sim_df, aes(x = sigma_p, y = mu_p)) + 
+  geom_line(color = "blue", size = 1.1) +
+  geom_point(aes(x = 0.0 * sigma, y = r_f + (mu-r_f)*0.0), color = "red", size = 3.0) + 
+  annotate("text", x = 0.2 * sigma, y = r_f + (mu-r_f)*0.0 + 0.01, label = label_0) +
+  geom_point(aes(x = w_star * sigma, y = r_f + (mu-r_f)*w_star), shape = 21, color = "red", fill = "white", size = 4, stroke = 4) + 
+  annotate("text", x = w_star * sigma + .2, y = r_f + (mu-r_f)*w_star + 0.1, label = label_42) +
+  geom_point(aes(x = 1.0 * sigma, y = r_f + (mu-r_f)*1.00), color = "red", size = 3.0) + 
+  annotate("text", x = 1.0 * sigma, y = r_f + (mu-r_f)*1.00 + 0.01, label = label_100) +
+  xlab("standard deviation of portfolio return") +
+  ylab("mean of portfolio return") +
+  ggtitle("Risk-return tradeoff of cash and risky asset")
+ggplotly(p)
+```
+
+
+Summary
+============================================
+
+column {.sidebar}
+--------------------------------------------
+
+### Overall
+
+The following tabs contain a summary of our findings based on this financial analysis review. Our findings will cover the following topics:
+
+Returns: Correlations and Returns Persistence
+Volatility: Monthly Volatility and Correlation, Market Spillover
+Loss: Value-at-Risk and Expected Shortfall
+Allocation: Risk Tolerance and Thresholds
+
+column {.tabset}
+--------------------------------------------
+
+### Arielle
+
+Returns of BUD, TWE.AX, and CWGL
+
+Beverages Return Correlation
+
+The correlations from the returns of each data source were analyzed.  TWE.AX and BUD had the strongest correlation, which was 0.113.  CWGL and BUD had a correlation of 0.0218, and CWGL and TWE.AX had a correlation of 0.0384.  
+
+BUD Daily Returns
+
+When analyzing daily returns, the goal is to identify lines that appear to all outside of 0.05 and   -0.05. The daily returns for BUD portrayed numerous significant spikes.  
+
+BUD ACF
+
+The autocorrelation function was used to determine any patterns in the returns.  The autocorrelation measures the randomness of at various time lags. There seemed to be a significant spike around Lag 5.
+
+
+BUD Return Distribution
+
+The returns seemed to be normally distributed with an outlier around -.10,  
+
+TWE.AX Daily Returns
+
+For the TWE.AX Returns, any lines that appeared outside of 0.1 and -0.1 were significant.  There appeared to be 6 outliers. 
+
+TWE.AX ACF
+
+There were 3 significant spikes between Lags 25 and 30. 
+
+TWE.AX Returns Distribution
+
+When analyzing the distribution of the returns, there was an outlier located near -0.2.
+
+CWGL Daily Returns
+
+The daily returns for CWGL were most consistent with only 2 outliers.  
+
+CWGL ACF
+
+There were 3 spikes around Lags 0, 5 and 10. 
+
+CWGL Returns Distribution
+
+There only appeared to be one significant outlier. 
+
+### Ace
+
+Volatility of BUD, TWE.AX, and CWGL
+
+Volatility
+
+Volatility is a statistical measure as it pertains to a given stock and the dispersion of returns for a security or market index. Usually the higher the volatility, the riskier the security is in that company and of course the lower the volatility, the more stable the security is and less risk is attributed.
+ 
+Anheuser -Busch (BUD)
+
+Looking at the BUD monthly volatility plot it is shown that the company has an implied volatility when the stocks drop. Although there are cases where the stocks rise the overall volatility of the company is high. This brings uncertainty to the price of the stock and the value of the company. Overall there is a downward trend which is not great news for the company, but the high peaks mean it is staying afloat and competing forcefully with the market. Knowing that the company recently purchased SAB-Miller it now has some debt which makes the company and readings show even more volatility. But looking at the big picture the company is still doing well and towards the end of the chart the company seems to be staying up with it’s market shares. Looking at only the BUD monthly volatility chart is only one piece of the puzzle. Other aspects of the company’s finances need to be looked at such as the balance sheet with strong earnings. If that shows good, then a volatile company might just be on its way up instead of on its way down.
+ 
+Treasure Wine Estates (TWE.AX)
+
+Treasury Wine Estates Limited is located around the world. Currently this chart shows the market shares and stocks is very volatile. It is showing at the beginning of the months it was volatile. Although some dips all still looked ok. Towards the end of the chart where the peaks stayed low the securities became less volatile. What is not shown by this chart is how strong this company is and how much money it has. Its portfolio is huge, and it can afford to have some very volatile months without anyone getting to scared just yet. Like most companies’ investors need to see past this short-term volatility and remember the history of the company and how strong it has been and probably will be. Many times, when the global market suffers and goes downhill then so does the smaller company markets. That is exactly what happened here and after analyzing other data this is just a market that is rolling with the punches of what the global market is doing. Nothing to be worried about here folks. Eventually the company may become more stable. Cheers!
+ 
+Crimson Wine Group (CWGL)
+
+Crimson Wine Group has an interesting plot. It is not volatile at all. Its line shows hardly any movement up or down. It took a huge drop from prior but over the last months has been very stable and not volatile. This is a less risky investment but remember sometimes if there is no risk then you might be safe, but you may not make it big. By that I mean you cannot make the big gains, but you won’t lose big either. Sometimes safe is better. Once again, looking at the company will let an investor know if less volatile is good. Making steady money can be better in the long run.
+
+Conclusion
+
+Volatility can be measured in few ways. There are beta coefficients, option pricing, and standard deviations. A bet coefficient of above 1% is more volatile than if it were to be below 1%. These charts show the beta coefficients. Although one way is not better than another an investor will need to choose his method and determine if the investment is too risky. 
+
+As the MAAM Company looks to expand its earnings and opportunities it will look at these charts to determine if these are the right companies to work with. The four financial analysts will review all volatility data and make our decisions. This is just one part of the holistic view we will examine. The data team will determine whether it is more beneficial to go with a more volatile company like BUD or TWE.AX in the hopes to get a big win or go with a less volatile company like CWGL and be happy with a mediocre win.
+
+### Mellissa
+
+Market Risk: Loss of BUD, TWE.AX, and CWGL
+
+In this section, we will analyze the historical financial loss of the following three different portfolios: a brewery (BUD) and two wine distilleries (TWE.AX and CWGL). A loss in finance means a decrease in the portfolio value. As we determine whether to enter a new product line into the market, it is valuable to look into the expected loss of each portfolio to better understand the risks involved. In the summary of plots in the Loss tab, the data reveals some outliers that are deep and shallow. We can also see that the distribution is very peaked. Some of these returns, or percentage price changes, are very close to zero.
+
+In estimating the value at risk (VaR) and expected shortfall (ES), it’s critical to understand these financial terms. Expected shortfall is the mean of distribution beyond the value at risk threshold, which combines the aspects of the Value-at-Risk (VaR) methodology with further information on the distribution of returns in the tail. ES can only be measured when there’s a VaR exceedance. The lack of data would make it difficult to make these evaluations. For instance, CWGL contains the least amount of data having been founded in 1991, versus BUD having the most amount of data, founded in 1366. Lastly, TWE.AX falls right in the middle as this company was founded in 1843. 
+
+Fortunately, we were able to pull sufficient data to translate this information into our plots and graphs to understand the riskiness of each asset. The density forecast helps summarize this information by combining both the VaR and ES as special cases. Expected shortfall, or the tail loss, enables us to identify what our expected loss will be if things do get bad. The two parameters of ES are the time horizon in days and the confidence levels. 
+
+The loss analysis shows that the overall VaR is 124,112.61, while the expected shortfall is 180,320.04. Overall, we can see that the ES is much bigger than VaR, but less than the maximum historical loss. The mean of the loss distribution should be greater than VaR. The tail end of the distribution has interesting peaks, and the data could be studied further. We set the tolerance level α equal to 95%, which would mean that a decision maker would not tolerate loss in more than 5% of all risk scenarios.
+
+For BUD, the ES shows L = 364,442.70 and U = 814,667.64 at .01 density.
+
+For TWE.AX, the ES shows L = 113,232.32 and U = 336,946.78 at .010 density. 
+
+For CWGL, the ES shows L = 1,927.44 and U = 6066.77 at 0 density.
+
+To summarize, margins earned over time result in the present values of margins valued at a risk-informed rate of return. All of the volatility clustering of the margins and values will act like the prices. In a downward trend, that trend will increase as prices try to move upwards. The high volatility would result in missed earning targets, shareholders selling, or the stock price dropping. If the equity falls short of the capital needed to meet risk tolerance requirements, then more capital might need to be raised in the markets, publicly or privately placed. Moreover, we can use this information to understand and make better financial decisions as we look into expanding our operations in the Beverages – Breweries, Wineries & Distilleries sector. 
+
+### Mindy
+
+Allocation of BUD, TWE.AX, and CWGL
+
+The Efficient Frontier:
+
+View the efficient frontier graph in the Allocation tab. Note that the blue portion of the parabola shape would be considered the efficient frontier. The blue curve shows where to recommend and allocate investments. The horizontal axis is the sigma or risk, and the vertical axis is mu_P which is the potential return given the risk. This graph allows us to minimize risk while making investment decisions. The green location indicates a 9% risk and a 1% return.
+
+Sharpe Mean CI:
+
+View the Sharpe Mean CI tab (daily mean: Max Sharpe Ratio) within the Allocation tab. The lower bound at 0.21 and the upper bound 2.52 indicate that within the two bounds (the vertical red lines) 95% of the daily means happen within this range. The optimal weights on this particular knit indicate investing 204.48 million in BUD, 381.37 million in TWE.AX (Treasury Wine Estates and Distilleries-Australia), and shorting 485.85 million on CWGL (Crimson Wine Group LTD-Napa CA). These weights add up to $1,000,000 with a daily return of 1% and a STDEV of 9% as noted on the efficient frontier. These weights will produce a minimum variance portfolio: BUD: 39.99%, TWE.AX: 18.27%, CWGL: 41.74% with a daily portfolio return of 0.02% and a STDEV of 0.87%.
+
+Sharpe Standard Deviation CI:
+
+View the Sharpe SD CI tab. You can see the right tail. 95% of the STDEV are between the two red vertical lines: 2.6 and 113.5 range.
+
+Max Sharpe Ratio Loss Thresholds:
+
+View the loss thresholds tab in the Allocation section. The threshold exceedances range from 411459 and -49881. The black line is the MEP (mean excess plot) and indicates the average of the threshold exceedances.
+
+Risky Capital:
+
+As you view the Risky Capital tab you will see a loss capital simulation. Which provides the expected shortfall losses. Again using a 95% confidence interval we can see the potential for shortfall losses outside of the upper bound.
+
+Collateral:
+
+The 0% risky asset is at a risk and return of 0% as we might expect. A 100% risky asset indicates a 140% risk with a potential for 250% return (a bit hard to imagine). At a -12% threshold we find negative return and negative risk which would need further investigation.
+
+Conclusions:
+
+We can understand from above and the graphs generated from the three data sources that CWGL is the least volatile of the three. BUD and TWE.AX are riskier but with better returns. As we consider a direction for MAAM to increase its earnings It would be recommended to continue to search for other competitors in the industry and their correlations before allocating the above mentioned capital.
+
+References
+============================================
+
+For Market Risk: Loss
+https://www.kevinsheppard.com/images/f/f5/Chapter8_tablet.pdf 
+
